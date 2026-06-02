@@ -5,7 +5,7 @@ This repository implements **VEC-DPO**, a visual evidence-calibrated preference 
 VEC-DPO is built on top of a LLaVA-style multimodal training pipeline. Instead of relying only on response-level preference labels, VEC-DPO decomposes model responses into fine-grained visual claims, estimates their visual evidence support, constructs evidence-calibrated preference pairs, and reweights the DPO objective according to the evidence gap between chosen and rejected responses.
 
 <p align="center">
-  <img src="assets/fig1.pdf" width="850">
+  <img src="assets/fig1.png" width="850">
 </p>
 
 ---
