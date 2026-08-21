@@ -1,3 +1,10 @@
+#!/bin/bash
+
+set -e
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${PROJECT_ROOT}"
+
 bash script/train/llava15_train_vec_dpo.sh \
   VEC_DPO_llava15_7b \
   /path/to/llava-v1.5-7b \

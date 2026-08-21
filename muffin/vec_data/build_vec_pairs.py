@@ -33,6 +33,16 @@ class PairBuilderConfig:
     keep_ties: bool = False
     sort_by_gap: bool = True
 
+    def __post_init__(self):
+        if self.alpha < 0:
+            raise ValueError("alpha must be non-negative.")
+        if self.min_weight <= 0 or self.max_weight < self.min_weight:
+            raise ValueError("Require 0 < min_weight <= max_weight.")
+        if self.min_gap < 0:
+            raise ValueError("min_gap must be non-negative.")
+        if self.max_pairs_per_sample == 0 or self.max_pairs_per_sample < -1:
+            raise ValueError("max_pairs_per_sample must be -1 or a positive integer.")
+
 
 class CandidateResponse:
     """
@@ -55,6 +65,10 @@ class CandidateResponse:
             claim if isinstance(claim, VisualClaim) else VisualClaim.from_dict(claim)
             for claim in claims
         ]
+        if not self.claims:
+            raise ValueError(
+                "Candidate response has no verified visual claims; evidence score is undefined."
+            )
         self.metadata = metadata or {}
 
     @classmethod

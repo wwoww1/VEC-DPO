@@ -185,6 +185,7 @@ class VisualEvidenceVerifier:
             {
                 "verification_rationale": result.rationale,
                 "verification_metadata": result.metadata or {},
+                "verification_pending": result.verifier == "llm_prompt",
             }
         )
 
@@ -251,6 +252,7 @@ Return JSON:
         if confidence is not None:
             try:
                 confidence = float(confidence)
+                confidence = max(0.0, min(1.0, confidence))
             except Exception:
                 confidence = None
 
@@ -421,6 +423,7 @@ def parse_args():
         type=str,
         default="cached",
         choices=["cached", "llm_prompt", "heuristic"],
+        help="llm_prompt exports prompts only; it does not call an external verifier.",
     )
     parser.add_argument(
         "--default-status",

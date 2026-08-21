@@ -42,7 +42,7 @@ VEC-DPO Training
 ├── script/train/           # Training launch scripts
 ├── eval/                   # Evaluation scripts
 ├── data/                   # Data files
-└── run_vec_dpo.sh          # Main launcher
+└── run.sh                  # Main launcher
 ```
 
 ## Installation
@@ -78,15 +78,41 @@ The final training data should follow this format:
 }
 ```
 
-### Training
-
-Run VEC-DPO training with:
+Run preprocessing modules with `python -m` from the repository root. For
+example, after candidate generation:
 
 ```bash
-bash run_vec_dpo.sh
-````
+python -m muffin.vec_data.claim_extractor \
+  --input data/candidates.json \
+  --output data/candidates_with_claims.json \
+  --mode heuristic
 
-The default configuration in `run_vec_dpo.sh` is:
+python -m muffin.vec_data.build_vec_pairs \
+  --input data/candidates_with_verified_claims.json \
+  --output data/vec_dpo_train.json \
+  --alpha 0.5
+```
+
+Evidence must be verified before pair construction. The `llm_prompt` modes
+only export prompts for an external LLM/VLM; they do not make API calls. Parse
+external outputs with `VisualClaimExtractor.parse_llm_claims` and
+`VisualEvidenceVerifier.parse_llm_verification_output`, or provide cached
+`supported` / `uncertain` / `unsupported` annotations. Pair construction
+rejects responses that contain no verified visual claims.
+
+When `evidence_gap` is present, training recomputes
+`evidence_weight = 1 + evidence_alpha * evidence_gap` and clamps it to the
+configured range. This keeps the command-line `evidence_alpha` authoritative.
+
+### Training
+
+After replacing the placeholder paths in `run.sh`, run VEC-DPO training with:
+
+```bash
+bash run.sh
+```
+
+The default configuration in `run.sh` is:
 
 ```bash
 bash script/train/llava15_train_vec_dpo.sh \

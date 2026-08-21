@@ -66,17 +66,10 @@ class VisualClaimExtractor:
         if self.config.mode == "heuristic":
             claims = self._extract_heuristic(response)
         elif self.config.mode == "llm_prompt":
-            # This mode returns one placeholder claim containing the prompt.
-            # The actual LLM call should be done outside this file.
-            prompt = self.build_llm_prompt(response)
-            claims = [
-                VisualClaim(
-                    claim=prompt,
-                    claim_type=ClaimType.OTHER,
-                    status=EvidenceStatus.UNCERTAIN,
-                    metadata={"is_extraction_prompt": True},
-                )
-            ]
+            # Prompt-only mode must not treat the instruction prompt itself as
+            # a visual claim. The caller stores the prompt separately and must
+            # parse the external LLM result with parse_llm_claims().
+            claims = []
         else:
             raise ValueError(f"Unsupported mode: {self.config.mode}")
 
@@ -453,11 +446,16 @@ def extract_claims_from_response_dict(
         response_item.get("response", response_item.get("answer", "")),
     )
 
-    claims = extractor.extract(text)
-
     new_item = dict(response_item)
     new_item["text"] = text
+
+    claims = extractor.extract(text)
     new_item["claims"] = [claim.to_dict() for claim in claims]
+
+    if extractor.config.mode == "llm_prompt":
+        new_item["claim_extraction_prompt"] = extractor.build_llm_prompt(text)
+        new_item["claim_extraction_pending"] = True
+
     return new_item
 
 
@@ -549,7 +547,7 @@ def parse_args():
         type=str,
         default="heuristic",
         choices=["heuristic", "llm_prompt"],
-        help="Claim extraction mode.",
+        help="Claim extraction mode. llm_prompt exports prompts but does not call an LLM.",
     )
     parser.add_argument(
         "--max-claims-per-response",

@@ -11,13 +11,26 @@ import torch.nn.functional as F
 class VecDPOLossConfig:
 
     beta: float = 0.1
+    evidence_alpha: float = 0.5
     label_smoothing: float = 0.0
     loss_type: str = "sigmoid"
     use_evidence_weight: bool = True
-    normalize_weighted_loss: bool = True
+    normalize_weighted_loss: bool = False
     min_evidence_weight: float = 0.5
     max_evidence_weight: float = 2.0
     reference_free: bool = False
+
+    def __post_init__(self):
+        if self.beta <= 0:
+            raise ValueError("beta must be positive.")
+        if self.evidence_alpha < 0:
+            raise ValueError("evidence_alpha must be non-negative.")
+        if not 0.0 <= self.label_smoothing <= 0.5:
+            raise ValueError("label_smoothing must be between 0 and 0.5.")
+        if self.min_evidence_weight <= 0:
+            raise ValueError("min_evidence_weight must be positive.")
+        if self.max_evidence_weight < self.min_evidence_weight:
+            raise ValueError("max_evidence_weight must be >= min_evidence_weight.")
 
 
 def _ensure_1d_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
@@ -38,16 +51,36 @@ def _ensure_1d_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
 
 def _prepare_evidence_weight(
     evidence_weight: Optional[torch.Tensor],
+    evidence_gap: Optional[torch.Tensor],
     losses: torch.Tensor,
     config: VecDPOLossConfig,
 ) -> torch.Tensor:
     """
     Prepare evidence weights for weighted loss computation.
     """
-    if evidence_weight is None or not config.use_evidence_weight:
+    if not config.use_evidence_weight:
         return torch.ones_like(losses)
 
-    if not isinstance(evidence_weight, torch.Tensor):
+    # Paper equation (13): w_E = 1 + alpha * evidence_gap. Prefer the
+    # gap over a precomputed weight so the training argument is authoritative.
+    if evidence_gap is not None:
+        if not isinstance(evidence_gap, torch.Tensor):
+            evidence_gap = torch.tensor(
+                evidence_gap,
+                dtype=losses.dtype,
+                device=losses.device,
+            )
+        if not torch.isfinite(evidence_gap).all():
+            raise ValueError("evidence_gap contains NaN or infinity.")
+        if (evidence_gap < 0).any():
+            raise ValueError("evidence_gap must be non-negative for chosen/rejected pairs.")
+        evidence_weight = 1.0 + config.evidence_alpha * evidence_gap
+    elif evidence_weight is None:
+        raise ValueError(
+            "Evidence weighting is enabled, but neither evidence_gap nor "
+            "evidence_weight was provided."
+        )
+    elif not isinstance(evidence_weight, torch.Tensor):
         evidence_weight = torch.tensor(
             evidence_weight,
             dtype=losses.dtype,
@@ -66,6 +99,9 @@ def _prepare_evidence_weight(
             f"evidence_weight batch size mismatch: "
             f"got {evidence_weight.shape[0]}, expected {losses.shape[0]}"
         )
+
+    if not torch.isfinite(evidence_weight).all():
+        raise ValueError("evidence_weight contains NaN or infinity.")
 
     evidence_weight = torch.clamp(
         evidence_weight,
@@ -87,6 +123,12 @@ def dpo_preference_logits(
     policy_chosen_logps = _ensure_1d_tensor(policy_chosen_logps, "policy_chosen_logps")
     policy_rejected_logps = _ensure_1d_tensor(policy_rejected_logps, "policy_rejected_logps")
 
+    if policy_chosen_logps.shape != policy_rejected_logps.shape:
+        raise ValueError(
+            "Policy chosen/rejected log-probability shapes must match: "
+            f"{tuple(policy_chosen_logps.shape)} != {tuple(policy_rejected_logps.shape)}"
+        )
+
     policy_logratios = policy_chosen_logps - policy_rejected_logps
 
     if reference_free:
@@ -100,6 +142,10 @@ def dpo_preference_logits(
 
         ref_chosen_logps = _ensure_1d_tensor(ref_chosen_logps, "ref_chosen_logps")
         ref_rejected_logps = _ensure_1d_tensor(ref_rejected_logps, "ref_rejected_logps")
+        if ref_chosen_logps.shape != policy_chosen_logps.shape:
+            raise ValueError("Reference chosen log-probability batch shape does not match policy.")
+        if ref_rejected_logps.shape != policy_rejected_logps.shape:
+            raise ValueError("Reference rejected log-probability batch shape does not match policy.")
         ref_logratios = ref_chosen_logps - ref_rejected_logps
 
     logits = policy_logratios - ref_logratios
@@ -147,10 +193,11 @@ def dpo_losses_from_logits(
 def reduce_weighted_losses(
     losses: torch.Tensor,
     evidence_weight: Optional[torch.Tensor],
+    evidence_gap: Optional[torch.Tensor],
     config: VecDPOLossConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    weights = _prepare_evidence_weight(evidence_weight, losses, config)
+    weights = _prepare_evidence_weight(evidence_weight, evidence_gap, losses, config)
 
     if config.use_evidence_weight:
         if config.normalize_weighted_loss:
@@ -193,6 +240,7 @@ def vec_dpo_loss(
     loss, weights = reduce_weighted_losses(
         losses=per_sample_losses,
         evidence_weight=evidence_weight,
+        evidence_gap=evidence_gap,
         config=config,
     )
 
@@ -242,6 +290,13 @@ def vec_dpo_loss(
                 device=logits.device,
             )
         evidence_gap = evidence_gap.to(device=logits.device, dtype=logits.dtype).view(-1)
+        if evidence_gap.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"evidence_gap batch size mismatch: got {evidence_gap.shape[0]}, "
+                f"expected {logits.shape[0]}"
+            )
+        if not torch.isfinite(evidence_gap).all():
+            raise ValueError("evidence_gap contains NaN or infinity.")
         metrics["evidence_gap_mean"] = evidence_gap.mean().detach()
         metrics["evidence_gap_min"] = evidence_gap.min().detach()
         metrics["evidence_gap_max"] = evidence_gap.max().detach()

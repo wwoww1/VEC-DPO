@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Dict, List, Optional
 import json
+import math
 
 
 class EvidenceStatus(str, Enum):
@@ -60,11 +61,18 @@ class VisualClaim:
         if isinstance(self.status, str):
             self.status = EvidenceStatus(self.status)
 
-        if self.score is None:
-            self.score = EVIDENCE_STATUS_TO_SCORE[self.status]
-
         if not isinstance(self.claim, str) or len(self.claim.strip()) == 0:
             raise ValueError("VisualClaim.claim must be a non-empty string.")
+
+        if self.score is not None:
+            self.score = float(self.score)
+            if not math.isfinite(self.score):
+                raise ValueError("VisualClaim.score must be finite when provided.")
+
+        if self.confidence is not None:
+            self.confidence = float(self.confidence)
+            if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+                raise ValueError("VisualClaim.confidence must be between 0 and 1.")
 
     def to_dict(self) -> Dict[str, Any]:
         item = asdict(self)
@@ -135,6 +143,19 @@ class VecDPOSample:
             for c in self.rejected_claims
         ]
 
+        for name in (
+            "chosen_evidence_score",
+            "rejected_evidence_score",
+            "evidence_gap",
+            "evidence_weight",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError(f"{name} must be finite when provided.")
+                setattr(self, name, value)
+
         if self.chosen_evidence_score is None and len(self.chosen_claims) > 0:
             self.chosen_evidence_score = compute_response_evidence_score(self.chosen_claims)
 
@@ -180,7 +201,14 @@ class VecDPOSample:
                 "evidence_gap is None. Provide evidence_gap or claim-level evidence scores."
             )
 
+        if alpha < 0:
+            raise ValueError("alpha must be non-negative.")
+        if min_weight <= 0 or max_weight < min_weight:
+            raise ValueError("Require 0 < min_weight <= max_weight.")
+
         weight = 1.0 + alpha * float(self.evidence_gap)
+        if not math.isfinite(weight):
+            raise ValueError("Computed evidence weight is not finite.")
         weight = max(min_weight, min(max_weight, weight))
         self.evidence_weight = weight
         return weight
@@ -246,10 +274,11 @@ def compute_response_evidence_score(claims: List[VisualClaim]) -> float:
 
 def load_vec_dpo_json(path: str) -> List[VecDPOSample]:
     """Load VEC-DPO samples from .json or .jsonl."""
-    if path.endswith(".json"):
+    lower_path = path.lower()
+    if lower_path.endswith(".json"):
         with open(path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
-    elif path.endswith(".jsonl"):
+    elif lower_path.endswith(".jsonl"):
         raw_data = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -258,6 +287,14 @@ def load_vec_dpo_json(path: str) -> List[VecDPOSample]:
                     raw_data.append(json.loads(line))
     else:
         raise ValueError(f"Unsupported file format: {path}")
+
+    if isinstance(raw_data, dict):
+        if "data" not in raw_data:
+            raise ValueError("Input JSON must be a list or a dict containing a 'data' list.")
+        raw_data = raw_data["data"]
+
+    if not isinstance(raw_data, list):
+        raise ValueError("VEC-DPO input data must be a list.")
 
     samples = []
     for idx, item in enumerate(raw_data):
@@ -302,6 +339,27 @@ def validate_vec_dpo_sample(sample: VecDPOSample) -> None:
             raise ValueError(
                 f"Sample {sample.sample_id}: need evidence_weight, evidence_gap, "
                 "or both chosen/rejected claim annotations."
+            )
+
+    if sample.evidence_gap is not None and sample.evidence_gap < 0:
+        raise ValueError(
+            f"Sample {sample.sample_id}: evidence_gap must be non-negative; "
+            "the visually better response must be the chosen response."
+        )
+
+    if sample.evidence_weight is not None and sample.evidence_weight <= 0:
+        raise ValueError(f"Sample {sample.sample_id}: evidence_weight must be positive.")
+
+    if (
+        sample.chosen_evidence_score is not None
+        and sample.rejected_evidence_score is not None
+        and sample.evidence_gap is not None
+    ):
+        expected_gap = sample.chosen_evidence_score - sample.rejected_evidence_score
+        if not math.isclose(sample.evidence_gap, expected_gap, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError(
+                f"Sample {sample.sample_id}: evidence_gap={sample.evidence_gap} is inconsistent "
+                f"with chosen_score - rejected_score={expected_gap}."
             )
 
 

@@ -33,6 +33,17 @@ class VecDPODataConfig:
     max_length: int = 2048
     lazy_preprocess: bool = True
     validate_data: bool = True
+    evidence_alpha: float = 0.5
+    min_evidence_weight: float = 0.5
+    max_evidence_weight: float = 2.0
+
+    def __post_init__(self):
+        if self.evidence_alpha < 0:
+            raise ValueError("evidence_alpha must be non-negative.")
+        if self.min_evidence_weight <= 0:
+            raise ValueError("min_evidence_weight must be positive.")
+        if self.max_evidence_weight < self.min_evidence_weight:
+            raise ValueError("max_evidence_weight must be >= min_evidence_weight.")
 
 
 class VecDPODataset(Dataset):
@@ -53,6 +64,13 @@ class VecDPODataset(Dataset):
         if data_config.validate_data:
             for sample in self.samples:
                 validate_vec_dpo_sample(sample)
+
+        gap_flags = [sample.evidence_gap is not None for sample in self.samples]
+        if any(gap_flags) and not all(gap_flags):
+            raise ValueError(
+                "Dataset mixes gap-based and weight-only samples. Use one evidence "
+                "representation consistently so batches have deterministic weighting."
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -126,7 +144,22 @@ class VecDPODataset(Dataset):
         labels = full_input_ids.clone()
 
         prompt_len = min(prompt_input_ids.shape[0], labels.shape[0])
+        if (
+            prompt_len > 0
+            and not torch.equal(
+                prompt_input_ids[:prompt_len],
+                full_input_ids[:prompt_len],
+            )
+        ):
+            # SentencePiece/BPE can merge the last prompt token with the first
+            # answer token. Keep that merged boundary token trainable.
+            prompt_len -= 1
         labels[:prompt_len] = IGNORE_INDEX
+
+        if not (labels != IGNORE_INDEX).any():
+            raise ValueError(
+                "The answer was fully truncated. Increase model_max_length or shorten the prompt."
+            )
 
         attention_mask = torch.ones_like(full_input_ids, dtype=torch.long)
 
@@ -151,13 +184,20 @@ class VecDPODataset(Dataset):
             answer=sample.rejected,
         )
 
-        evidence_weight = sample.evidence_weight
-        if evidence_weight is None:
-            evidence_weight = sample.compute_evidence_weight()
-
         evidence_gap = sample.evidence_gap
-        if evidence_gap is None:
-            evidence_gap = 0.0
+
+        if sample.evidence_gap is not None:
+            evidence_weight = sample.compute_evidence_weight(
+                alpha=self.data_config.evidence_alpha,
+                min_weight=self.data_config.min_evidence_weight,
+                max_weight=self.data_config.max_evidence_weight,
+            )
+        else:
+            evidence_weight = sample.evidence_weight
+            if evidence_weight is None:
+                raise ValueError(
+                    f"Sample {sample.sample_id}: missing both evidence_gap and evidence_weight."
+                )
 
         return {
             "id": sample.sample_id,
@@ -171,7 +211,11 @@ class VecDPODataset(Dataset):
             "rejected_labels": rejected["labels"],
             "rejected_attention_mask": rejected["attention_mask"],
 
-            "evidence_gap": torch.tensor(float(evidence_gap), dtype=torch.float32),
+            "evidence_gap": (
+                torch.tensor(float(evidence_gap), dtype=torch.float32)
+                if evidence_gap is not None
+                else None
+            ),
             "evidence_weight": torch.tensor(float(evidence_weight), dtype=torch.float32),
 
             "chosen_evidence_score": torch.tensor(
@@ -250,10 +294,6 @@ class VecDPODataCollator:
                 padding_value=0,
             ),
 
-            "evidence_gap": torch.stack(
-                [x["evidence_gap"] for x in instances],
-                dim=0,
-            ),
             "evidence_weight": torch.stack(
                 [x["evidence_weight"] for x in instances],
                 dim=0,
@@ -267,6 +307,15 @@ class VecDPODataCollator:
                 dim=0,
             ),
         }
+
+        evidence_gaps = [x["evidence_gap"] for x in instances]
+        if all(gap is not None for gap in evidence_gaps):
+            batch["evidence_gap"] = torch.stack(evidence_gaps, dim=0)
+        elif any(gap is not None for gap in evidence_gaps):
+            raise ValueError(
+                "A batch cannot mix gap-based and weight-only VEC-DPO samples. "
+                "Use one evidence representation consistently across the dataset."
+            )
 
         images = [x["image"] for x in instances]
         if all(img.shape == images[0].shape for img in images):

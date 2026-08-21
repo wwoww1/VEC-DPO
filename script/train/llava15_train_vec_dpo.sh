@@ -2,6 +2,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${PROJECT_ROOT}"
+
 EXP_NAME=$1
 MODEL_PATH=$2
 VISION_TOWER_PATH=$3
@@ -46,14 +50,14 @@ if [ -z "$EVIDENCE_ALPHA" ]; then
   EVIDENCE_ALPHA="0.5"
 fi
 
-export CUDA_VISIBLE_DEVICES=${GPU_IDS}
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export TOKENIZERS_PARALLELISM=false
 
-NUM_GPUS=$(echo ${GPU_IDS} | awk -F',' '{print NF}')
+NUM_GPUS=$(echo "${GPU_IDS}" | awk -F',' '{print NF}')
 
 OUTPUT_DIR="checkpoints/${EXP_NAME}"
 
-mkdir -p ${OUTPUT_DIR}
+mkdir -p "${OUTPUT_DIR}"
 
 echo "========== VEC-DPO Training =========="
 echo "EXP_NAME          : ${EXP_NAME}"
@@ -72,19 +76,20 @@ torchrun \
   --nnodes=1 \
   --nproc_per_node=${NUM_GPUS} \
   --master_port=29600 \
-  muffin/train/train_vec_dpo.py \
-  --model_name_or_path ${MODEL_PATH} \
+  --module muffin.train.train_vec_dpo \
+  --deepspeed script/zero3_offload.json \
+  --model_name_or_path "${MODEL_PATH}" \
   --version llava_v1 \
-  --data_path ${DATA_PATH} \
+  --data_path "${DATA_PATH}" \
   --image_folder "" \
-  --vision_tower ${VISION_TOWER_PATH} \
+  --vision_tower "${VISION_TOWER_PATH}" \
   --mm_projector_type mlp2x_gelu \
   --mm_vision_select_layer -2 \
   --mm_vision_select_feature patch \
   --image_aspect_ratio pad \
   --bf16 True \
-  --output_dir ${OUTPUT_DIR} \
-  --num_train_epochs 1 \
+  --output_dir "${OUTPUT_DIR}" \
+  --num_train_epochs 2 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
   --gradient_accumulation_steps 16 \
@@ -106,6 +111,7 @@ torchrun \
   --dpo_beta ${DPO_BETA} \
   --evidence_alpha ${EVIDENCE_ALPHA} \
   --use_evidence_weight True \
+  --normalize_weighted_loss False \
   --min_evidence_weight 0.5 \
   --max_evidence_weight 2.0 \
   --loss_type sigmoid

@@ -26,6 +26,16 @@ class EvidenceScoringConfig:
     normalize_by_claim_count: bool = True
     use_claim_type_weight: bool = False
 
+    def __post_init__(self):
+        if self.alpha < 0:
+            raise ValueError("alpha must be non-negative.")
+        if self.min_weight <= 0:
+            raise ValueError("min_weight must be positive.")
+        if self.max_weight < self.min_weight:
+            raise ValueError("max_weight must be >= min_weight.")
+        if not math.isfinite(self.uncertain_score):
+            raise ValueError("uncertain_score must be finite.")
+
 
 DEFAULT_CLAIM_TYPE_WEIGHTS: Dict[ClaimType, float] = {
     ClaimType.OBJECT: 1.0,

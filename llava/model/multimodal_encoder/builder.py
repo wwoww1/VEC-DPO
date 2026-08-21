@@ -3,7 +3,14 @@ from .clip_encoder import CLIPVisionTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
-    vision_tower = "[Path of your vision tower model]"
+    vision_tower = getattr(
+        vision_tower_cfg,
+        "mm_vision_tower",
+        getattr(vision_tower_cfg, "vision_tower", None),
+    )
+    if not isinstance(vision_tower, str) or not vision_tower:
+        raise ValueError("vision_tower/mm_vision_tower must be a non-empty model path or ID.")
+
     is_absolute_path_exists = os.path.exists(vision_tower)
     if is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion") or "ShareGPT4V" in vision_tower:
         return CLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)

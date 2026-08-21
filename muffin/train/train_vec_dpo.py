@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import pathlib
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -9,10 +8,7 @@ import torch
 import transformers
 from transformers import AutoTokenizer, HfArgumentParser
 
-from llava.model import *
-from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
-from llava.model.multimodal_encoder.builder import build_vision_tower
-from llava.constants import DEFAULT_IMAGE_TOKEN
+from llava.model.language_model.llava_llama import LlavaConfig, LlavaLlamaForCausalLM
 
 from muffin.datasets.vec_dpo_dataset import (
     VecDPODataConfig,
@@ -33,6 +29,9 @@ class ModelArguments:
     mm_projector_type: str = field(default="mlp2x_gelu")
     mm_vision_select_layer: int = field(default=-2)
     mm_vision_select_feature: str = field(default="patch")
+    mm_patch_merge_type: str = field(default="flat")
+    mm_use_im_start_end: bool = field(default=False)
+    mm_use_im_patch_token: bool = field(default=False)
     image_aspect_ratio: str = field(default="pad")
 
     freeze_backbone: bool = field(default=False)
@@ -59,7 +58,7 @@ class VecDPOArguments:
 
     loss_type: str = field(default="sigmoid")
     label_smoothing: float = field(default=0.0)
-    normalize_weighted_loss: bool = field(default=True)
+    normalize_weighted_loss: bool = field(default=False)
     reference_free: bool = field(default=False)
 
 
@@ -125,8 +124,6 @@ def get_peft_state_maybe_zero_3(named_params, bias):
 
 
 def find_all_linear_names(model):
-    import bitsandbytes as bnb
-
     cls = torch.nn.Linear
     lora_module_names = set()
 
@@ -162,9 +159,20 @@ def load_tokenizer(model_args: ModelArguments, training_args: TrainingArguments)
 
 
 def load_model(model_args: ModelArguments, training_args: TrainingArguments):
+    config = LlavaConfig.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+    )
+    config.mm_vision_tower = model_args.vision_tower
+    config.mm_projector_type = model_args.mm_projector_type
+    config.mm_vision_select_layer = model_args.mm_vision_select_layer
+    config.mm_vision_select_feature = model_args.mm_vision_select_feature
+    config.mm_patch_merge_type = model_args.mm_patch_merge_type
+
     model = LlavaLlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        config=config,
         torch_dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
     )
 
@@ -173,6 +181,10 @@ def load_model(model_args: ModelArguments, training_args: TrainingArguments):
     model.config.mm_projector_type = model_args.mm_projector_type
     model.config.mm_vision_select_layer = model_args.mm_vision_select_layer
     model.config.mm_vision_select_feature = model_args.mm_vision_select_feature
+    model.config.mm_patch_merge_type = model_args.mm_patch_merge_type
+    model.config.mm_use_im_start_end = model_args.mm_use_im_start_end
+    model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
+    model.config.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
     model.config.image_aspect_ratio = model_args.image_aspect_ratio
     model.config.tokenizer_model_max_length = training_args.model_max_length
     model.config.tokenizer_padding_side = "right"
@@ -200,11 +212,14 @@ def build_reference_model(
     model_args: ModelArguments,
     training_args: TrainingArguments,
     vec_dpo_args: VecDPOArguments,
+    tokenizer,
 ):
     if vec_dpo_args.reference_free:
         return None
 
     ref_model = load_model(model_args, training_args)
+    ref_model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+    ref_model.resize_token_embeddings(len(tokenizer))
     ref_model.eval()
 
     for p in ref_model.parameters():
@@ -229,6 +244,16 @@ def apply_lora_if_needed(model, training_args: TrainingArguments):
     )
 
     model = get_peft_model(model, lora_config)
+
+    if training_args.gradient_checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, inputs, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
     model.print_trainable_parameters()
 
     return model
@@ -264,6 +289,7 @@ def train():
     model = load_model(model_args, training_args)
     tokenizer = load_tokenizer(model_args, training_args)
 
+    model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
     model.resize_token_embeddings(len(tokenizer))
 
     model = apply_lora_if_needed(model, training_args)
@@ -272,6 +298,7 @@ def train():
         model_args=model_args,
         training_args=training_args,
         vec_dpo_args=vec_dpo_args,
+        tokenizer=tokenizer,
     )
 
     image_processor = model.get_vision_tower().image_processor
@@ -284,6 +311,9 @@ def train():
         max_length=training_args.model_max_length,
         lazy_preprocess=data_args.lazy_preprocess,
         validate_data=data_args.validate_data,
+        evidence_alpha=vec_dpo_args.evidence_alpha,
+        min_evidence_weight=vec_dpo_args.min_evidence_weight,
+        max_evidence_weight=vec_dpo_args.max_evidence_weight,
     )
 
     data_module = make_vec_dpo_data_module(
@@ -295,6 +325,7 @@ def train():
 
     trainer_config = VecDPOTrainerConfig(
         beta=vec_dpo_args.dpo_beta,
+        evidence_alpha=vec_dpo_args.evidence_alpha,
         label_smoothing=vec_dpo_args.label_smoothing,
         loss_type=vec_dpo_args.loss_type,
         use_evidence_weight=vec_dpo_args.use_evidence_weight,

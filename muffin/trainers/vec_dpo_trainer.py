@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -12,11 +13,12 @@ from muffin.losses.vec_dpo_loss import VecDPOLoss, VecDPOLossConfig
 @dataclass
 class VecDPOTrainerConfig:
     beta: float = 0.1
+    evidence_alpha: float = 0.5
     label_smoothing: float = 0.0
     loss_type: str = "sigmoid"
 
     use_evidence_weight: bool = True
-    normalize_weighted_loss: bool = True
+    normalize_weighted_loss: bool = False
     min_evidence_weight: float = 0.5
     max_evidence_weight: float = 2.0
 
@@ -39,6 +41,7 @@ class VecDPOTrainer(Trainer):
 
         loss_config = VecDPOLossConfig(
             beta=self.vec_dpo_config.beta,
+            evidence_alpha=self.vec_dpo_config.evidence_alpha,
             label_smoothing=self.vec_dpo_config.label_smoothing,
             loss_type=self.vec_dpo_config.loss_type,
             use_evidence_weight=self.vec_dpo_config.use_evidence_weight,
@@ -51,11 +54,56 @@ class VecDPOTrainer(Trainer):
         self.vec_dpo_loss = VecDPOLoss(loss_config)
 
         if self.ref_model is not None:
-            self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
 
+            if self.is_deepspeed_enabled:
+                self.ref_model = self._prepare_deepspeed(self.ref_model)
+            else:
+                self.ref_model = self.accelerator.prepare_model(
+                    self.ref_model,
+                    evaluation_mode=True,
+                )
+
+            self.ref_model.eval()
+
         self._stored_metrics = {}
+
+    def _prepare_deepspeed(self, model):
+        """Prepare the frozen reference model with the active ZeRO config."""
+        import deepspeed
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+
+        hidden_size = None
+        if hasattr(model, "config"):
+            hidden_sizes = getattr(model.config, "hidden_sizes", None)
+            hidden_size = max(hidden_sizes) if hidden_sizes else getattr(
+                model.config,
+                "hidden_size",
+                None,
+            )
+
+        if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
+            config_kwargs.update(
+                {
+                    "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                    "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                    "zero_optimization.stage3_prefetch_bucket_size": 0.9
+                    * hidden_size
+                    * hidden_size,
+                }
+            )
+
+        # Only ZeRO-3 shards the frozen reference model. For ZeRO-1/2, keep a
+        # regular per-device copy, matching the established DPO setup.
+        if config_kwargs["zero_optimization"]["stage"] != 3:
+            config_kwargs["zero_optimization"]["stage"] = 0
+
+        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+        model.eval()
+        return model
 
     @staticmethod
     def _get_batch_logps(
@@ -67,6 +115,9 @@ class VecDPOTrainer(Trainer):
         logits = logits[:, :-1, :]
 
         loss_mask = labels != -100
+        token_counts = loss_mask.sum(dim=-1)
+        if (token_counts == 0).any():
+            raise ValueError("A DPO response has no trainable answer tokens after masking.")
         labels[labels == -100] = 0
 
         log_probs = logits.log_softmax(dim=-1)
@@ -79,7 +130,7 @@ class VecDPOTrainer(Trainer):
         logps = (per_token_logps * loss_mask).sum(dim=-1)
 
         if average_log_prob:
-            logps = logps / loss_mask.sum(dim=-1).clamp_min(1)
+            logps = logps / token_counts
 
         return logps
 
